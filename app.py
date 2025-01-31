@@ -49,7 +49,7 @@ class DynamicState:
 
     def ui_state_controller(self):
         """生成动态UI组件状态"""
-        # [control_button, thought_editor, reset_button]
+        # [control_button, thought_editor, next_turn_btn, clear_btn]
         lang_data = LANGUAGE_CONFIG[self.current_language]
         control_value = (
             lang_data["pause_btn"] if self.should_stream else lang_data["generate_btn"]
@@ -71,20 +71,21 @@ class DynamicState:
             gr.update(value=control_value, variant=control_variant),
             gr.update() if self.label_passthrough else gr.update(label=editor_label),
             gr.update(interactive=not self.should_stream),
+            gr.update(interactive=not self.should_stream),
         )
         self.label_passthrough = False
         return output
     
     def reset_workspace(self, chatbot_value=None):
-        """重置工作区状态"""
+        """重置工作区状态，保留对话历史"""
         self.stream_completed = False
         self.should_stream = False
         self.in_cot = True
         self.waiting_api = False
         return self.ui_state_controller() + (
-            "",
-            "",
-            LANGUAGE_CONFIG["en"]["bot_default"] if chatbot_value is None else chatbot_value,
+            "",  # clear thought_editor
+            "",  # clear prompt_input
+            chatbot_value if chatbot_value is not None else gr.update(),  # preserve chatbot if no new value
         )
 
 
@@ -111,37 +112,68 @@ class CoordinationManager:
 
 
 class ConvoState:
-    """State of current ROUND of convo"""
+    """State manager for multi-turn conversations"""
 
     def __init__(self):
         self.throughput = AppConfig.DEFAULT_THROUGHPUT
         self.sync_threshold = AppConfig.SYNC_THRESHOLD_DEFAULT
         self.current_language = "en"
         self.convo = []
-        self.initialize_new_round()
         self.is_error = False
+        # Initialize current before calling initialize_new_round
+        self.current = {
+            "user": "",
+            "cot": "",
+            "result": ""
+        }
+        self.initialize_new_round()
 
     def initialize_new_round(self):
-        self.current = {}
-        self.current["user"] = ""
-        self.current["cot"] = ""
-        self.current["result"] = ""
-        self.convo.append(self.current)
+        """Start a new conversation round while preserving history"""
+        # Save current round to history if it contains content
+        if self.current.get("user") or self.current.get("result"):
+            self.convo.append(self.current.copy())
+        
+        # Create new round
+        self.current = {
+            "user": "",
+            "cot": "",
+            "result": ""
+        }
+
+    def clear_history(self):
+        """Clear all conversation history"""
+        self.convo = []
+        self.initialize_new_round()
 
     def flatten_output(self):
+        """Convert conversation history and current round into message format"""
         output = []
+        # Add history messages
         for round in self.convo:
-            output.append({"role": "user", "content": round["user"]})
-            if len(round["cot"]) > 0:
-                output.append(
-                    {
-                        "role": "assistant",
-                        "content": round["cot"],
-                        "metadata": {"title": f"Chain of Thought"},
-                    }
-                )
-            if len(round["result"]) > 0:
+            if round.get("user"):
+                output.append({"role": "user", "content": round["user"]})
+            if round.get("cot"):
+                output.append({
+                    "role": "assistant",
+                    "content": round["cot"],
+                    "metadata": {"title": "Chain of Thought"}
+                })
+            if round.get("result"):
                 output.append({"role": "assistant", "content": round["result"]})
+        
+        # Add current round if not empty
+        if self.current.get("user"):
+            output.append({"role": "user", "content": self.current["user"]})
+        if self.current.get("cot"):
+            output.append({
+                "role": "assistant",
+                "content": self.current["cot"],
+                "metadata": {"title": "Chain of Thought"}
+            })
+        if self.current.get("result"):
+            output.append({"role": "assistant", "content": self.current["result"]})
+        
         return output
 
     def generate_ai_response(self, user_prompt, current_content, dynamic_state):
@@ -294,9 +326,8 @@ def update_interface_language(selected_lang, convo_state, dynamic_state):
             variant="secondary" if dynamic_state.should_stream else "primary",
         ),
         gr.update(label=lang_data["language_label"]),
-        gr.update(
-            value=lang_data["clear_btn"], interactive=not dynamic_state.should_stream
-        ),
+        gr.update(value="New Turn ➡️", interactive=not dynamic_state.should_stream),
+        gr.update(value=lang_data["clear_btn"], interactive=not dynamic_state.should_stream),
         gr.update(value=lang_data["introduction"]),
         gr.update(value=lang_data["bot_default"], label=lang_data["bot_label"]),
     ]
@@ -305,8 +336,8 @@ def update_interface_language(selected_lang, convo_state, dynamic_state):
 theme = gr.themes.Base(font="system-ui", primary_hue="stone")
 
 with gr.Blocks(theme=theme, css_paths="styles.css") as demo:
-    convo_state = gr.State(ConvoState)
-    dynamic_state = gr.State(DynamicState)
+    convo_state = gr.State(ConvoState())
+    dynamic_state = gr.State(DynamicState())
 
     bot_default = LANGUAGE_CONFIG["en"]["bot_default"] + [
                     {
@@ -350,7 +381,12 @@ with gr.Blocks(theme=theme, css_paths="styles.css") as demo:
                     value=LANGUAGE_CONFIG["en"]["generate_btn"], variant="primary"
                 )
                 next_turn_btn = gr.Button(
-                    value=LANGUAGE_CONFIG["en"]["clear_btn"], interactive=True
+                    value="New Turn ➡️", interactive=True
+                )
+                clear_btn = gr.Button(
+                    value=LANGUAGE_CONFIG["en"]["clear_btn"], 
+                    interactive=True,
+                    variant="secondary"
                 )
 
         with gr.Column(scale=1, min_width=500):
@@ -362,6 +398,10 @@ with gr.Blocks(theme=theme, css_paths="styles.css") as demo:
                 show_copy_all_button=True,
                 show_share_button=True,
                 label=LANGUAGE_CONFIG["en"]["bot_label"],
+                render=lambda x: {
+                    "visible": True,
+                    "collapsed": x.get("metadata", {}).get("title") == "Chain of Thought"
+                }
             )
             with gr.Row():
                 sync_threshold_slider = gr.Slider(
@@ -384,7 +424,7 @@ with gr.Blocks(theme=theme, css_paths="styles.css") as demo:
             intro_md = gr.Markdown(LANGUAGE_CONFIG["en"]["introduction"], visible=False)
 
     # 交互逻辑
-    stateful_ui = (control_button, thought_editor, next_turn_btn)
+    stateful_ui = (control_button, thought_editor, next_turn_btn, clear_btn)
 
     throughput_control.change(
         lambda val, s: setattr(s, "throughput", val),
@@ -405,6 +445,28 @@ with gr.Blocks(theme=theme, css_paths="styles.css") as demo:
             prompt, content, dynamic_state
         ):
             yield response
+
+    def handle_new_turn(dynamic_state, convo_state):
+        """Handle new turn button click"""
+        # Save current round and start new one
+        convo_state.initialize_new_round()
+        # Reset workspace but keep chatbot content
+        dynamic_state.stream_completed = False
+        dynamic_state.should_stream = False
+        dynamic_state.in_cot = True
+        dynamic_state.waiting_api = False
+        # Return UI updates
+        ui_state = dynamic_state.ui_state_controller()
+        return ui_state + (
+            "",  # clear thought_editor
+            "",  # clear prompt_input
+            gr.update(),  # preserve chatbot
+        )
+
+    def handle_clear(dynamic_state, convo_state):
+        """Handle clear button click"""
+        convo_state.clear_history()  # Clear all history
+        return dynamic_state.reset_workspace(bot_default)  # Reset to default state
 
     gr.on(
         [control_button.click, prompt_input.submit, thought_editor.submit],
@@ -427,8 +489,16 @@ with gr.Blocks(theme=theme, css_paths="styles.css") as demo:
     )
 
     next_turn_btn.click(
-        lambda d: d.reset_workspace(bot_default),
-        [dynamic_state],
+        handle_new_turn,
+        [dynamic_state, convo_state],
+        stateful_ui + (thought_editor, prompt_input, chatbot),
+        concurrency_limit=None,
+        show_progress=False
+    )
+
+    clear_btn.click(
+        handle_clear,
+        [dynamic_state, convo_state],
         stateful_ui + (thought_editor, prompt_input, chatbot),
         concurrency_limit=None,
         show_progress=False
@@ -446,6 +516,7 @@ with gr.Blocks(theme=theme, css_paths="styles.css") as demo:
             control_button,
             lang_selector,
             next_turn_btn,
+            clear_btn,
             intro_md,
             chatbot,
         ],
